@@ -21,8 +21,7 @@ Call tools in this exact order:
 
 1. screenplay_screen   — create the Screen file with the provided locators
 2. screenplay_task     — implement the interactions
-3. screenplay_question — verify the outcome
-4. screenplay_spec     — write the tests
+3. screenplay_spec     — write the tests with assertions
 
 ### Step 1: screenplay_screen
 Use ONLY the locators from PAGE DISCOVERY RESULTS in the user message.
@@ -70,31 +69,9 @@ screenplay_task({
   ]
 })
 
-### Step 3: screenplay_question
-Checks the outcome using the locators from PAGE DISCOVERY RESULTS.
-Always uses: const page = BrowseTheWeb.as(actor).getPage()
-
-For login success (check flash message):
-screenplay_question({
-  name: "IsLoginSuccessful",
-  projectDir: "<PROJECT_DIR>",
-  returnType: "boolean",
-  screenImport: "LoginScreen",
-  description: "Checks if login flash message is visible",
-  implementation: "const page = BrowseTheWeb.as(actor).getPage(); return page.locator('#flash.success').isVisible();"
-})
-
-For text changed (combo picker):
-screenplay_question({
-  name: "HasResultChanged",
-  projectDir: "<PROJECT_DIR>",
-  returnType: "boolean",
-  description: "Checks that a combo result is now visible",
-  implementation: "const page = BrowseTheWeb.as(actor).getPage(); const text = await page.locator('<CSS_FROM_DISCOVER>').textContent() ?? ''; return text.trim().length > 0;"
-})
-
-### Step 4: screenplay_spec
-Imports Task + Question, uses Bob, calls toApp() and current().
+### Step 3: screenplay_spec
+Imports Task, uses Bob, calls toApp() and uses Element.toBe.visible() for assertions.
+Use discovered locators from PAGE DISCOVERY RESULTS for assertions.
 
 screenplay_spec({
   name: "login",
@@ -102,13 +79,13 @@ screenplay_spec({
   describeLabel: "Login feature",
   imports: [
     "import { LoginTask } from '../src/screenplay/tasks/login-task';",
-    "import { IsLoginSuccessful } from '../src/screenplay/questions/is-login-successful';",
-    "import { BrowseTheWeb } from '@testla/screenplay-playwright/web';"
+    "import { LoginScreen } from '../src/screenplay/screens/login-screen';",
+    "import { Element } from '@testla/screenplay-playwright/web';"
   ],
   tests: [
     {
       name: "logs in with valid credentials and verifies success",
-      body: "await Bob.attemptsTo(LoginTask.toApp());\nconst ok = await Bob.asks(IsLoginSuccessful.current());\nexpect(ok).toBe(true);"
+      body: "await Bob.attemptsTo(LoginTask.toApp());\nawait Bob.asks(\n    Element.toBe.visible(LoginScreen.LOGIN_BUTTON)\n);"
     },
     {
       name: "takes a screenshot after login",
@@ -117,14 +94,21 @@ screenplay_spec({
   ]
 })
 
+IMPORTANT:
+- Do NOT call screenplay_question — use Element.toBe.visible(Screen.PROP) directly in tests
+- Element MUST be a valid property from the discovered Screen class
+- Use properties from PAGE DISCOVERY RESULTS for all assertions
+
 ## Hard rules
 - ONLY use locators from PAGE DISCOVERY RESULTS — never invent selectors
 - NEVER invent CSS selectors or placeholder locators
 - NEVER call testla_create_project (project already scaffolded)
 - NEVER use placeholder paths — use exact PROJECT_DIR from task
-- Always: Bob as actor, toApp() for Task, current() for Question
-- Fill.in(Screen.PROP).with('value') — not Fill.in('#selector')
-- Click.on(Screen.PROP) — not Click.on('#selector')`;
+- Do NOT call screenplay_question — use Element.toBe.visible() directly
+- Always: Bob as actor, toApp() for Task factory
+- Fill.in(Screen.PROP, 'value') — not Fill.in('#selector').with()
+- Click.on(Screen.PROP) — not Click.on('#selector')
+- Element.toBe.visible(Screen.PROP) — not page.locator()`;
 
 export class AgentLoop {
     private provider: LLMProvider;

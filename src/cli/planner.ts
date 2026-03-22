@@ -34,6 +34,8 @@ export interface TestPlan {
     assertionDescription: string;
     /** The prop name from the Screen to assert on, e.g. "FLASH_MESSAGE_OUTPUT" */
     assertionTarget?: string;
+    /** Text to validate on the page (e.g., "You logged into a secure area!") */
+    assertionText?: string;
     /** Playwright assertion expression using the assertionTarget locator */
     assertionExpression?: string;
 }
@@ -44,6 +46,8 @@ Given:
 - A task description with numbered steps
 - A list of discovered page elements with their Playwright locators
 
+CRITICAL: Use ONLY the element prop names from the discovered elements list. Do NOT invent prop names.
+
 Return ONLY a JSON object (no markdown, no explanation) with this exact shape:
 {
   "screenName": "LoginScreen",
@@ -52,23 +56,33 @@ Return ONLY a JSON object (no markdown, no explanation) with this exact shape:
   "describeLabel": "Login at the-internet",
   "actions": [
     { "action": "Navigate" },
-    { "action": "Fill", "target": "USERNAME_INPUT", "value": "tomsmith" },
-    { "action": "Fill", "target": "PASSWORD_INPUT", "value": "SuperSecretPassword!" },
-    { "action": "Click", "target": "LOGIN_BUTTON" }
+    { "action": "Fill", "target": "USERNAME", "value": "tomsmith" },
+    { "action": "Fill", "target": "PASSWORD", "value": "SuperSecretPassword!" },
+    { "action": "Click", "target": "LOGIN" }
   ],
-  "assertionDescription": "Checks if the success flash message is visible",
-  "assertionTarget": "FLASH_MESSAGE_OUTPUT",
-  "assertionExpression": "return page.locator('#flash.success').isVisible();"
+  "assertionDescription": "Checks that login was successful",
+  "assertionTarget": "LOGIN",
+  "assertionText": "You logged into a secure area!"
 }
+
+Example mapping - if discovered elements are:
+- USERNAME (textbox for username)
+- PASSWORD (textbox for password)
+- LOGIN (button to submit)
+- FORK_ME_ON_GITHUB (link element)
+
+Use EXACTLY these names in actions and assertionTarget. Do NOT invent names like "USERNAME_INPUT" or "LOGIN_BUTTON".
 
 Rules:
 - actions MUST follow the order from the task description exactly
 - Navigate is always first, no target needed
 - Fill actions use target (element prop name) and value (the actual text to type)
 - Click actions use target only
-- Use ONLY element propNames from the provided discovered elements
-- assertionTarget must be an output element from the discovered list
-- assertionExpression must use: const page = BrowseTheWeb.as(actor).getPage();`;
+- Use ONLY element propNames from the provided discovered elements list — NEVER invent prop names
+- For text validation: if task says "Validate the text: ..." or "Check for message: ...", add assertionText field
+- assertionTarget should be a prop name from discovered elements OR omit if using assertionText only
+- If task wants to validate text content (e.g., "You logged in!" message), use assertionText for that text
+- Do NOT add _INPUT or _BUTTON suffixes — use the exact prop names from discovery`;
 
 export async function planFromDiscovery(
     provider: LLMProvider,

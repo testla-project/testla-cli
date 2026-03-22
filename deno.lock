@@ -7,11 +7,13 @@
     "jsr:@cliffy/flags@1.0.0": "1.0.0",
     "jsr:@cliffy/internal@1.0.0": "1.0.0",
     "jsr:@cliffy/keycode@1.0.0": "1.0.0",
+    "jsr:@cliffy/prompt@*": "1.0.0",
     "jsr:@cliffy/prompt@1": "1.0.0",
     "jsr:@cliffy/table@1": "1.0.0",
     "jsr:@cliffy/table@1.0.0": "1.0.0",
     "jsr:@std/assert@^1.0.18": "1.0.19",
     "jsr:@std/encoding@^1.0.10": "1.0.10",
+    "jsr:@std/fmt@*": "1.0.9",
     "jsr:@std/fmt@^1.0.9": "1.0.9",
     "jsr:@std/internal@^1.0.12": "1.0.12",
     "jsr:@std/io@~0.225.3": "0.225.3",
@@ -25,7 +27,7 @@
       "dependencies": [
         "jsr:@cliffy/internal",
         "jsr:@std/encoding",
-        "jsr:@std/fmt",
+        "jsr:@std/fmt@^1.0.9",
         "jsr:@std/io"
       ]
     },
@@ -35,7 +37,7 @@
         "jsr:@cliffy/flags",
         "jsr:@cliffy/internal",
         "jsr:@cliffy/table@1.0.0",
-        "jsr:@std/fmt",
+        "jsr:@std/fmt@^1.0.9",
         "jsr:@std/semver",
         "jsr:@std/text"
       ]
@@ -60,7 +62,7 @@
         "jsr:@cliffy/internal",
         "jsr:@cliffy/keycode",
         "jsr:@std/assert",
-        "jsr:@std/fmt",
+        "jsr:@std/fmt@^1.0.9",
         "jsr:@std/io",
         "jsr:@std/path",
         "jsr:@std/text"
@@ -69,7 +71,7 @@
     "@cliffy/table@1.0.0": {
       "integrity": "3fdaa9e1ef1ea62022108adabd826932bdea8dd05497079896febcd41322907f",
       "dependencies": [
-        "jsr:@std/fmt"
+        "jsr:@std/fmt@^1.0.9"
       ]
     },
     "@std/assert@1.0.19": {

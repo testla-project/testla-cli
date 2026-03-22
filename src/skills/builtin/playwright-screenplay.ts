@@ -393,7 +393,7 @@ const generateSpec: AgentTool = {
 
         const content =
 `import { test, expect } from '${actorsFile}';
-import { Navigate, Click, Fill, Element, BrowseTheWeb } from '@testla/screenplay-playwright/web';
+import { Element, BrowseTheWeb } from '@testla/screenplay-playwright/web';
 ${extraImports}
 
 test.describe('${describeLabel}', () => {

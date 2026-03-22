@@ -396,7 +396,7 @@ export const discoverPageTool: AgentTool = {
 
             report += `## Copy-paste for screenplay_screen elements array\n\n`;
             for (const el of elements) {
-                report += `{ propName: "${el.propName}", selector: "${el.locator}", isLazy: true },\n`;
+                report += `{ propName: ${JSON.stringify(el.propName)}, selector: ${JSON.stringify(el.locator)}, isLazy: true },\n`;
             }
 
             return { success: true, output: report };

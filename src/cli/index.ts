@@ -211,54 +211,68 @@ async function runAgentTask(
     }
     console.log(green('✅'), taskResult.output.split('\n')[0]);
 
-    // 3) Question
-    const assertImpl = plan.assertionExpression
-        ? `const page = BrowseTheWeb.as(actor).getPage();\n        ${plan.assertionExpression}`
-        : `const page = BrowseTheWeb.as(actor).getPage();\n        return page.locator('body').isVisible();`;
-
-    console.log(cyan('📄'), `Generating ${plan.questionName}...`);
-    const questionResult = await questionTool.execute({
-        name: plan.questionName,
-        projectDir,
-        returnType: 'boolean',
-        screenImport: plan.assertionTarget ? plan.screenName : undefined,
-        description: plan.assertionDescription,
-        implementation: assertImpl,
-        factoryMethod: 'current',
-    });
-    if (!questionResult.success) {
-        console.log(red('❌ Question generation failed:'), questionResult.error);
-        return;
-    }
-    console.log(green('✅'), questionResult.output.split('\n')[0]);
-
-    // 4) Spec
+    // 3) Spec — uses Element.toBe.visible() directly, no separate Question class
+    //    Pattern: await Bob.asks(Element.toBe.visible(Screen.PROP))
+    //    Or for text validation: expect(page).toContainText('text')
     const kebabTask = toKebab(plan.taskName);
-    const kebabQ    = toKebab(plan.questionName);
+    
+    // Validate assertionTarget exists in screenElements, otherwise fallback to last element
+    const elementNames = new Set(screenElements.map(e => e.name));
+    const assertionProp = (plan.assertionTarget && elementNames.has(plan.assertionTarget)) 
+        ? plan.assertionTarget 
+        : screenElements[screenElements.length - 1]?.name ?? 'ELEMENT';
+    
+    if (plan.assertionTarget && !elementNames.has(plan.assertionTarget)) {
+        console.log(yellow('⚠️  Assertion target not found:'), plan.assertionTarget);
+        console.log(yellow('     Available elements:'), [...elementNames].join(', '));
+        console.log(yellow('     Using fallback:'), assertionProp);
+    }
+
     console.log(cyan('📄'), `Generating ${featureName}.spec.ts...`);
+    
+    // Build assertion body based on whether we have text validation
+    let assertionBody: string;
+    if (plan.assertionText) {
+        // Text-based assertion: use page.locator(...).toContainText()
+        assertionBody = 
+            `const page = BrowseTheWeb.as(Bob).getPage();\n` +
+            `        await expect(page).toContainText(${JSON.stringify(plan.assertionText)});`;
+    } else {
+        // Element-based assertion: use Element.toBe.visible()
+        assertionBody = `Element.toBe.visible(${plan.screenName}.${assertionProp})`;
+    }
+    
     const specResult = await specTool.execute({
         name: featureName,
         projectDir,
         describeLabel: plan.describeLabel,
         imports: [
+            `import { ${plan.screenName} } from '../src/screenplay/screens/${toKebab(plan.screenName)}';`,
             `import { ${plan.taskName} } from '../src/screenplay/tasks/${kebabTask}';`,
-            `import { ${plan.questionName} } from '../src/screenplay/questions/${kebabQ}';`,
-            `import { BrowseTheWeb } from '@testla/screenplay-playwright/web';`,
+            // Element is already imported in spec template, so don't duplicate it
         ],
         tests: [
             {
-                name: `${plan.describeLabel} — verifies outcome`,
+                name: 'execute task and verify outcome',
                 body:
-                    `await Bob.attemptsTo(${plan.taskName}.toApp());\n` +
-                    `const ok = await Bob.asks(${plan.questionName}.current());\n` +
-                    `expect(ok).toBe(true);`,
+                    `await Bob.attemptsTo(\n` +
+                    `            ${plan.taskName}.toApp()\n` +
+                    `        );\n` +
+                    (plan.assertionText 
+                        ? `        ${assertionBody}`
+                        : `        await Bob.asks(\n` +
+                          `            ${assertionBody}\n` +
+                          `        );`
+                    ),
             },
             {
-                name: `${plan.describeLabel} — takes a screenshot`,
+                name: 'takes a screenshot',
                 body:
-                    `await Bob.attemptsTo(${plan.taskName}.toApp());\n` +
-                    `const page = BrowseTheWeb.as(Bob).getPage();\n` +
-                    `await page.screenshot({ path: 'test-results/${featureName}.png', fullPage: true });`,
+                    `await Bob.attemptsTo(\n` +
+                    `            ${plan.taskName}.toApp()\n` +
+                    `        );\n` +
+                    `        const page = BrowseTheWeb.as(Bob).getPage();\n` +
+                    `        await page.screenshot({ path: 'test-results/${featureName}.png', fullPage: true });`,
             },
         ],
     });
@@ -322,23 +336,28 @@ async function runAgentTask(
         const errorOutput = (testResult.output ?? '').slice(0, 2500);
         const fixPrompt =
             `Fix the failing TypeScript/Playwright tests.\n\n` +
-            `PROJECT_DIR=${projectDir}\n` +
-            `BASE_URL=${url}\n\n` +
+            `Project directory: ${projectDir}\n\n` +
             `Test error output:\n${errorOutput}${fileContext}\n\n` +
             `Instructions:\n` +
-            `- Read the error carefully — identify which file has the problem\n` +
             `- Use read_file to inspect the failing file\n` +
-            `- Use write_file to fix it (correct imports, fix API calls, fix locators)\n` +
-            `- Do NOT call testla_create_project\n` +
-            `- Do NOT rewrite working files\n` +
-            `- After fixing, the test runner will be called automatically`;
+            `- Use write_file to fix it\n` +
+            `- Only fix TypeScript errors, wrong imports, or wrong API calls\n` +
+            `- Do NOT use screenplay_screen, screenplay_task, screenplay_feature or any other generator tool\n` +
+            `- Do NOT invent new file paths`;
 
         console.log(cyan(`🔧 Fix attempt ${attempt}...`));
+
+        // Fix loop only gets read/write/shell — no screenplay generators
+        // This prevents the LLM from hallucinating new files with wrong paths
+        const fixTools = allTools.filter((t) =>
+            ['shell', 'read_file', 'write_file', 'list_dir'].includes(t.name)
+        );
+        const fixProvider = createProvider(config.llm);
         const fixAgent = new AgentLoop(
-            provider,
-            agentTools,
+            fixProvider,
+            fixTools,
             15,
-            registry.getSystemPromptAdditions(),
+            '',
         );
 
         await fixAgent.run({
@@ -361,15 +380,40 @@ function toKebab(str: string): string {
         .replace(/^-+|-+$/g, '');
 }
 
-interface ParsedElement { propName: string; selector: string; isLazy: boolean }
+interface ParsedElement { name: string; selector: string; isLazy: boolean }
 
 function parseDiscoveredElements(report: string): ParsedElement[] {
     const elements: ParsedElement[] = [];
-    // Match lines: { propName: "X", selector: "Y", isLazy: true },
-    const re = /\{\s*propName:\s*"([^"]+)",\s*selector:\s*"([^"]+)",\s*isLazy:\s*(true|false)\s*\}/g;
-    let m;
-    while ((m = re.exec(report)) !== null) {
-        elements.push({ propName: m[1], selector: m[2], isLazy: m[3] === 'true' });
+    // discover.ts outputs: { propName: "X", selector: "Y", isLazy: true },
+    // screenplay_screen expects: { name: "X", selector: "Y", isLazy: true }
+    // Parse each line that looks like a screenplay_screen element object
+    const lines = report.split('\n');
+    for (const line of lines) {
+        const trimmed = line.trim();
+        // Match lines like: { propName: "...", selector: "...", isLazy: true },
+        if (!trimmed.startsWith('{')) continue;
+        if (!trimmed.includes('propName:')) continue;
+        
+        try {
+            // Convert to valid JSON by adding quotes around keys and replacing JavaScript boolean with JSON true/false
+            const jsonStr = trimmed
+                .replace(/,\s*$/, '') // Remove trailing comma
+                .replace(/propName:/g, '"propName":')
+                .replace(/selector:/g, '"selector":')
+                .replace(/isLazy:/g, '"isLazy":');
+            
+            const obj = JSON.parse(jsonStr);
+            if (obj.propName && obj.selector && typeof obj.isLazy === 'boolean') {
+                elements.push({ 
+                    name: obj.propName, 
+                    selector: obj.selector, 
+                    isLazy: obj.isLazy 
+                });
+            }
+        } catch (e) {
+            // Skip malformed lines
+            continue;
+        }
     }
     return elements;
 }
@@ -382,7 +426,7 @@ function buildActionStrings(actions: TaskAction[], screenName: string, url: stri
                 // Falls back to the discovered URL if the env var is not set.
                 return `Navigate.to(process.env.BASE_URL ?? ${JSON.stringify(url)})`;
             case 'Fill':
-                return `Fill.in(${screenName}.${a.target}).with(${JSON.stringify(a.value ?? '')})`;
+                return `Fill.in(${screenName}.${a.target}, ${JSON.stringify(a.value ?? '')})`;
             case 'Click':
                 return `Click.on(${screenName}.${a.target})`;
             case 'Wait':
