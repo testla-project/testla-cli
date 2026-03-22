@@ -1,0 +1,7 @@
+{
+    "name": "testla-screenplay",
+    "description": "Full testla-screenplay-playwright skill — generate Screens, Tasks, Questions, Actors, Fixtures, and validate structure",
+    "version": "1.0.0",
+    "author": "testla",
+    "entrypoint": "index.ts"
+}
