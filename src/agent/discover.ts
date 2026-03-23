@@ -1,40 +1,87 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // testla-cli · src/agent/discover.ts
 //
-// discover_page tool — wraps @playwright/mcp via stdio transport
+// walkFlow() — single browser session, browser-driven state detection.
 //
-// @playwright/mcp is a stdio MCP server:
-//   npx @playwright/mcp@latest
-// It reads JSON-RPC from stdin, writes responses to stdout.
-// No HTTP server, no port — pure process communication.
+// KEY PRINCIPLE: The browser decides when a new page state begins.
+// The LLM plan provides hints and ordering — the browser provides ground truth.
+//
+// After every click we check:
+//   1. Did the URL change?         → definite new page state
+//   2. Did significant DOM change? → possible new state (SPA content update)
+//   3. Did a modal/overlay appear? → snapshot in-place, tag as modal
+//
+// This handles:
+//   - Classic multi-page apps (URL changes)
+//   - SPAs (URL stays, content changes)
+//   - Modals and overlays
+//   - Dynamic content (AJAX, lazy load)
+//   - Multi-step forms / wizards
 // ─────────────────────────────────────────────────────────────────────────────
 
-import type { AgentTool, ToolInput, ToolResult } from './types.ts';
-import { bold, cyan, red } from 'jsr:@std/fmt/colors';
+import { bold, cyan, green, red, yellow } from 'jsr:@std/fmt/colors';
+import type { FlowPlan } from '../cli/planner.ts';
+
+// ── Public types ──────────────────────────────────────────────────────────
+
+export interface ElementInfo {
+    propName: string;
+    role: string;
+    name: string;
+    locator: string;
+    kind: 'interactive' | 'output';
+}
+
+export interface AssertionResult {
+    assertionKind: string;
+    assertionValue?: string;
+    passed: boolean;
+    locator: string;
+    note: string;
+    /** Best-matching propName from the discovered elements of this page state */
+    matchedPropName?: string;
+}
+
+export interface DiscoveredState {
+    pageStateId: string;
+    screenName: string;
+    url: string;
+    elements: ElementInfo[];
+    screenshotPath: string;
+    assertionResults: AssertionResult[];
+    /** How this state was detected */
+    detectedBy: 'navigate' | 'url-change' | 'content-change' | 'modal' | 'plan';
+}
+
+export interface WalkResult {
+    states: DiscoveredState[];
+    success: boolean;
+    failedAt?: string;
+}
 
 // ── Stdio MCP client ──────────────────────────────────────────────────────
 
 class StdioMCPClient {
     private proc: Deno.ChildProcess | null = null;
     private writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
-    private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+    private pending = new Map<number, {
+        resolve: (v: unknown) => void;
+        reject: (e: Error) => void;
+        timer: ReturnType<typeof setTimeout>;
+    }>();
     private idCounter = 1;
-    private readLoop: Promise<void> | null = null;
     private enc = new TextEncoder();
     private dec = new TextDecoder();
-    private buffer = '';
+    private buf = '';
 
     async start(): Promise<void> {
-        // Try global install first, fall back to npx
         const hasBinary = await new Deno.Command('which', {
-            args: ['playwright-mcp'],
-            stdout: 'null', stderr: 'null',
-        }).output().then((r) => r.code === 0).catch(() => false);
+            args: ['playwright-mcp'], stdout: 'null', stderr: 'null',
+        }).output().then(r => r.code === 0).catch(() => false);
 
         const cmd = hasBinary
             ? new Deno.Command('playwright-mcp', {
-                args: ['--headless'],
-                stdin: 'piped', stdout: 'piped', stderr: 'null',
+                args: ['--headless'], stdin: 'piped', stdout: 'piped', stderr: 'null',
             })
             : new Deno.Command('npx', {
                 args: ['--yes', '@playwright/mcp@latest', '--headless'],
@@ -43,370 +90,502 @@ class StdioMCPClient {
 
         this.proc = cmd.spawn();
         this.writer = this.proc.stdin.getWriter();
+        this.startReadLoop();
 
-        // Start reading responses
-        this.readLoop = this.startReadLoop();
-
-        // Initialize the MCP session
-        await this.request('initialize', {
+        await this.rpc('initialize', {
             protocolVersion: '2024-11-05',
             capabilities: { tools: {} },
             clientInfo: { name: 'testla-cli', version: '1.0' },
         });
     }
 
-    private async startReadLoop(): Promise<void> {
-        const reader = this.proc!.stdout.getReader();
-        try {
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                this.buffer += this.dec.decode(value);
-                this.processBuffer();
-            }
-        } catch { /* process ended */ }
+    private startReadLoop() {
+        (async () => {
+            const reader = this.proc!.stdout.getReader();
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    this.buf += this.dec.decode(value);
+                    this.flush();
+                }
+            } catch { /* ended */ }
+        })();
     }
 
-    private processBuffer(): void {
-        // MCP over stdio uses newline-delimited JSON
-        const lines = this.buffer.split('\n');
-        this.buffer = lines.pop() ?? '';
-
+    private flush() {
+        const lines = this.buf.split('\n');
+        this.buf = lines.pop() ?? '';
         for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
+            const t = line.trim();
+            if (!t) continue;
             try {
-                const msg = JSON.parse(trimmed);
-                if (msg.id !== undefined) {
-                    const handler = this.pending.get(msg.id);
-                    if (handler) {
-                        this.pending.delete(msg.id);
-                        if (msg.error) {
-                            handler.reject(new Error(JSON.stringify(msg.error)));
-                        } else {
-                            handler.resolve(msg.result);
-                        }
-                    }
+                const msg = JSON.parse(t);
+                const h = this.pending.get(msg.id);
+                if (h) {
+                    this.pending.delete(msg.id);
+                    clearTimeout(h.timer);
+                    msg.error
+                        ? h.reject(new Error(JSON.stringify(msg.error)))
+                        : h.resolve(msg.result);
                 }
-            } catch { /* skip malformed */ }
+            } catch { /* skip */ }
         }
     }
 
-    async request(method: string, params: unknown): Promise<unknown> {
+    rpc(method: string, params: unknown): Promise<unknown> {
         const id = this.idCounter++;
-        const message = JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n';
-
         return new Promise((resolve, reject) => {
-            this.pending.set(id, { resolve, reject });
-
-            // Timeout per request
-            const timeout = setTimeout(() => {
+            const timer = setTimeout(() => {
                 this.pending.delete(id);
-                reject(new Error(`MCP request timed out: ${method}`));
-            }, 25_000);
-
-            this.writer!.write(this.enc.encode(message)).then(() => {
-                // Wrap resolve to clear timeout
-                const origResolve = resolve;
-                this.pending.set(id, {
-                    resolve: (v) => { clearTimeout(timeout); origResolve(v); },
-                    reject:  (e) => { clearTimeout(timeout); reject(e); },
-                });
-            }).catch(reject);
+                reject(new Error(`MCP timeout: ${method}`));
+            }, 30_000);
+            this.pending.set(id, { resolve, reject, timer });
+            const msg = JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n';
+            this.writer!.write(this.enc.encode(msg)).catch(reject);
         });
     }
 
-    async callTool(name: string, args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text?: string; data?: string }> }> {
-        const result = await this.request('tools/call', { name, arguments: args });
-        return result as { content: Array<{ type: string; text?: string; data?: string }> };
+    async tool(name: string, args: Record<string, unknown>): Promise<string> {
+        const r = await this.rpc('tools/call', { name, arguments: args }) as {
+            content: Array<{ type: string; text?: string }>;
+        };
+        return (r.content ?? []).filter(c => c.type === 'text').map(c => c.text ?? '').join('\n');
     }
 
-    async stop(): Promise<void> {
-        try { await this.callTool('browser_close', {}); } catch { /* ignore */ }
+    async stop() {
+        try { await this.tool('browser_close', {}); } catch { /* ignore */ }
         try { this.writer?.close(); } catch { /* ignore */ }
         try { this.proc?.kill('SIGTERM'); } catch { /* ignore */ }
     }
 }
 
-// ── Parse accessibility snapshot text → locators ─────────────────────────
+// ── Accessibility snapshot parsing ────────────────────────────────────────
 
-interface DiscoveredElement {
-    kind: 'interactive' | 'output';
-    role: string;
-    name: string;
-    locator: string;
-    propName: string;
-}
-
-const INTERACTIVE_ROLES = new Set([
+const INTERACTIVE = new Set([
     'button', 'link', 'textbox', 'searchbox', 'checkbox', 'radio',
     'combobox', 'listbox', 'menuitem', 'switch', 'tab', 'spinbutton',
 ]);
 
-function roleToLocator(role: string, name: string): string {
-    if (!name) return `page.getByRole('${role}')`;
+const OUTPUT_ROLES = /alert|status|region|paragraph|heading/;
 
-    // Inputs: use getByLabel
+function locatorFor(role: string, name: string): string {
+    if (!name) return `page.getByRole('${role}')`;
     if (['textbox', 'searchbox', 'spinbutton', 'combobox'].includes(role)) {
         return `page.getByLabel(${JSON.stringify(name)})`;
     }
-    // Everything else: getByRole with name
     return `page.getByRole('${role}', { name: ${JSON.stringify(name)} })`;
 }
 
-function toPropName(name: string, role: string): string {
+function toProp(name: string, role: string, suffix = ''): string {
     const base = (name || role)
-        .toUpperCase()
-        .replace(/[^A-Z0-9]+/g, '_')
-        .replace(/^_+|_+$/g, '')
-        .slice(0, 40);
-    return base || 'ELEMENT';
+        .toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 40);
+    return (base || 'ELEMENT') + suffix;
 }
 
-// playwright-mcp snapshot format (text):
-//   - button "Login" [ref=e1]
-//   - textbox "Username" [ref=e2]
-//   - link "Home" [ref=e3]
-function parseSnapshot(snapshot: string): DiscoveredElement[] {
-    const elements: DiscoveredElement[] = [];
+function parseSnapshot(snap: string): ElementInfo[] {
     const seen = new Set<string>();
-
-    for (const line of snapshot.split('\n')) {
-        // Match: optional indent + "- role "name""
+    const out: ElementInfo[] = [];
+    for (const line of snap.split('\n')) {
         const m = line.match(/^\s*-\s+(\w[\w-]*)\s+"([^"]+)"/);
         if (!m) continue;
-
         const [, role, name] = m;
-
-        if (INTERACTIVE_ROLES.has(role)) {
-            const locator = roleToLocator(role, name);
-            if (seen.has(locator)) continue;
-            seen.add(locator);
-
-            elements.push({
-                kind: 'interactive',
-                role,
-                name,
-                locator,
-                propName: toPropName(name, role),
-            });
-        } else if (/alert|status|region/.test(role)) {
-            const locator = roleToLocator(role, name);
-            if (seen.has(locator)) continue;
-            seen.add(locator);
-
-            elements.push({
-                kind: 'output',
-                role,
-                name,
-                locator,
-                propName: toPropName(name, role) + '_OUTPUT',
-            });
+        const locator = locatorFor(role, name);
+        if (seen.has(locator)) continue;
+        seen.add(locator);
+        if (INTERACTIVE.has(role)) {
+            out.push({ kind: 'interactive', role, name, locator, propName: toProp(name, role) });
+        } else if (OUTPUT_ROLES.test(role)) {
+            out.push({ kind: 'output', role, name, locator, propName: toProp(name, role, '_AREA') });
         }
     }
-
-    return elements;
+    return out;
 }
 
-// ── The AgentTool ─────────────────────────────────────────────────────────
+/** Extract current URL from snapshot text */
+function extractUrl(snap: string): string {
+    return snap.match(/Page URL:\s*(\S+)/)?.[1] ?? '';
+}
 
-export const discoverPageTool: AgentTool = {
-    name: 'discover_page',
-    description:
-        'Navigate to a URL with a real Playwright browser, take a screenshot, ' +
-        'and extract all interactive elements with verified accessibility-based locators ' +
-        '(getByRole, getByLabel). Uses @playwright/mcp via stdio. ' +
-        'Always call this FIRST before generating screenplay files.',
-    parameters: {
-        type: 'object',
-        properties: {
-            url: { type: 'string', description: 'The URL to visit' },
-            outputDir: {
-                type: 'string',
-                description: 'Where to save screenshots (default: test-results/discover)',
-            },
-            waitForSelector: {
-                type: 'string',
-                description: 'Optional text/selector to wait for before extracting',
-            },
-        },
-        required: ['url'],
-    },
+/** Count interactive elements — rough measure of page complexity */
+function countInteractive(snap: string): number {
+    return (snap.match(/^\s*-\s+\w[\w-]*\s+"/gm) ?? []).length;
+}
 
-    async execute(input: ToolInput): Promise<ToolResult> {
-        const url = input.url as string;
-        const outputDir = (input.outputDir as string | undefined) ??
-            `${Deno.cwd()}/test-results/discover`;
-        const waitForSelector = input.waitForSelector as string | undefined;
+// ── Element matching (hint → ref) ─────────────────────────────────────────
 
-        const enc = new TextEncoder();
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-        const screenshotPath = `${outputDir}/snapshot-${timestamp}.png`;
+function findRef(snap: string, hint: string, preferRole?: string): string | null {
+    if (!hint) return null;
+    const hl = hint.toLowerCase();
+    let best = 0, bestRef: string | null = null;
 
-        Deno.stdout.writeSync(enc.encode(
-            `\n  🔍  Discovering page: ${bold(url)}\n`,
-        ));
+    for (const line of snap.split('\n')) {
+        const m = line.match(/^\s*-\s+(\w[\w-]*)\s+"([^"]+)".*\[ref=([^\]]+)\]/);
+        if (!m) continue;
+        const [, role, name, ref] = m;
+        const nl = name.toLowerCase();
+        let score = 0;
 
-        await Deno.mkdir(outputDir, { recursive: true });
-
-        const client = new StdioMCPClient();
-
-        try {
-            // ── Start MCP process ─────────────────────────────────────
-            Deno.stdout.writeSync(enc.encode(`      Starting @playwright/mcp...\n`));
-            try {
-                await client.start();
-            } catch (startErr) {
-                Deno.stdout.writeSync(enc.encode(
-                    `\n  ${red('❌')}  Could not start @playwright/mcp\n` +
-                    `      Run: npm install -g @playwright/mcp@latest\n` +
-                    `      Error: ${String(startErr).slice(0, 120)}\n\n`,
-                ));
-                return {
-                    success: false,
-                    output: '',
-                    error: `@playwright/mcp not available. Run: npm install -g @playwright/mcp@latest`,
-                };
-            }
-
-            // ── Navigate ─────────────────────────────────────────────
-            Deno.stdout.writeSync(enc.encode(`      Navigating...\n`));
-
-            let navResult: { content: Array<{ type: string; text?: string }> };
-            try {
-                navResult = await client.callTool('browser_navigate', { url });
-            } catch (navErr) {
-                const msg = String(navErr);
-                // Take screenshot of error state
-                await client.callTool('browser_screenshot', {
-                    filename: screenshotPath, raw: false,
-                }).catch(() => {});
-                await client.stop();
-
-                const isNet = /ERR_NAME_NOT_RESOLVED|ERR_CONNECTION|ENOTFOUND|ECONNREFUSED/i.test(msg);
-                Deno.stdout.writeSync(enc.encode(
-                    `\n  ${red('❌')}  Page not reachable\n` +
-                    `      URL    : ${url}\n` +
-                    `      Reason : ${msg.slice(0, 150)}\n` +
-                    (isNet ? `      Hint   : Check URL spelling and network connection.\n` : '') +
-                    `      Screenshot: ${screenshotPath}\n\n`,
-                ));
-                return {
-                    success: false,
-                    output: '',
-                    error: `Page not reachable: ${msg.slice(0, 200)}. Screenshot: ${screenshotPath}`,
-                };
-            }
-
-            // Check for HTTP error in response text
-            const navText = (navResult.content ?? []).map((c) => c.text ?? '').join('\n');
-            // Only flag real HTTP error codes — not timing values like "535ms"
-            // playwright-mcp nav errors include text like "failed: net::ERR_..." or "HTTP 404"
-            const statusMatch = navText.match(/\bHTTP[/ ]+(4\d\d|5\d\d)\b|\bstatus[: ]+(4\d\d|5\d\d)\b/i);
-            if (statusMatch) {
-                const status = parseInt(statusMatch[1] ?? statusMatch[2], 10);
-                await client.callTool('browser_screenshot', { filename: screenshotPath, raw: false }).catch(() => {});
-                await client.stop();
-
-                const hint = status === 404 ? 'Page not found — check the URL.'
-                    : status === 401 ? 'Unauthorized — page requires login first.'
-                    : status === 403 ? 'Forbidden — access denied.'
-                    : status >= 500 ? 'Server error — the site may be down.'
-                    : `HTTP ${status} error.`;
-
-                Deno.stdout.writeSync(enc.encode(
-                    `\n  ${red('❌')}  HTTP ${status}\n` +
-                    `      Hint  : ${hint}\n` +
-                    `      Screenshot: ${screenshotPath}\n\n`,
-                ));
-                return {
-                    success: false,
-                    output: '',
-                    error: `HTTP ${status}: ${hint} Screenshot: ${screenshotPath}`,
-                };
-            }
-
-            // ── Optional wait ─────────────────────────────────────────
-            if (waitForSelector) {
-                await client.callTool('browser_wait_for', {
-                    text: waitForSelector, timeout: 5000,
-                }).catch(() => {});
-            }
-
-            // ── Screenshot ────────────────────────────────────────────
-            Deno.stdout.writeSync(enc.encode(`      Taking screenshot...\n`));
-            await client.callTool('browser_screenshot', {
-                filename: screenshotPath, raw: false,
-            }).catch(() => {});
-
-            // ── Accessibility snapshot ────────────────────────────────
-            Deno.stdout.writeSync(enc.encode(`      Reading accessibility tree...\n`));
-            const snapResult = await client.callTool('browser_snapshot', {});
-            await client.stop();
-
-            const snapText = (snapResult.content ?? [])
-                .filter((c) => c.type === 'text')
-                .map((c) => c.text ?? '')
-                .join('\n');
-
-            const elements = parseSnapshot(snapText);
-            const interactive = elements.filter((e) => e.kind === 'interactive');
-            const outputs = elements.filter((e) => e.kind === 'output');
-
-            // ── Terminal summary ──────────────────────────────────────
-            Deno.stdout.writeSync(enc.encode(
-                `\n  ${cyan('📸')}  Done\n` +
-                `      Screenshot  : ${screenshotPath}\n` +
-                `      Interactive : ${interactive.length}\n` +
-                `      Outputs     : ${outputs.length}\n\n`,
-            ));
-
-            if (elements.length === 0) {
-                return {
-                    success: true,
-                    output:
-                        `Page loaded but no elements found.\n` +
-                        `Screenshot: ${screenshotPath}\n` +
-                        `Page may require authentication or dynamic content.\n` +
-                        `Raw snapshot:\n${snapText.slice(0, 800)}`,
-                };
-            }
-
-            // ── LLM report ────────────────────────────────────────────
-            let report = `# Discovered elements at ${url}\n`;
-            report += `Screenshot: ${screenshotPath}\n\n`;
-
-            if (interactive.length) {
-                report += `## Interactive elements\n\n`;
-                for (const el of interactive) {
-                    report += `- **${el.propName}** (${el.role}: "${el.name}")\n`;
-                    report += `  Locator: \`${el.locator}\`\n`;
-                }
-                report += `\n`;
-            }
-
-            if (outputs.length) {
-                report += `## Output elements\n\n`;
-                for (const el of outputs) {
-                    report += `- **${el.propName}** (${el.role}: "${el.name}")\n`;
-                    report += `  Locator: \`${el.locator}\`\n`;
-                }
-                report += `\n`;
-            }
-
-            report += `## Copy-paste for screenplay_screen elements array\n\n`;
-            for (const el of elements) {
-                report += `{ propName: ${JSON.stringify(el.propName)}, selector: ${JSON.stringify(el.locator)}, isLazy: true },\n`;
-            }
-
-            return { success: true, output: report };
-
-        } catch (err) {
-            await client.stop().catch(() => {});
-            Deno.stdout.writeSync(enc.encode(
-                `\n  ${red('❌')}  discover_page error: ${String(err).slice(0, 200)}\n\n`,
-            ));
-            return { success: false, output: '', error: `discover_page: ${err}` };
+        if (preferRole && role === preferRole) score += 2;
+        for (const w of hl.split(/\W+/).filter(Boolean)) {
+            if (nl.includes(w)) score += 3;
         }
-    },
-};
+        if (nl === hl || nl.includes(hl) || hl.includes(nl)) score += 5;
+        if (score > best) { best = score; bestRef = ref; }
+    }
+    return bestRef;
+}
+
+// ── Change detection ──────────────────────────────────────────────────────
+
+interface PageState {
+    url: string;
+    interactiveCount: number;
+    snap: string;
+}
+
+type ChangeKind = 'none' | 'url-change' | 'content-change' | 'modal';
+
+function detectChange(before: PageState, after: PageState): ChangeKind {
+    // 1. URL changed → definite navigation
+    if (before.url && after.url && before.url !== after.url) {
+        return 'url-change';
+    }
+
+    // 2. Modal/dialog appeared (new dialog/alertdialog role in snapshot)
+    const hadDialog = /role="(?:dialog|alertdialog)"/.test(before.snap) ||
+                      before.snap.includes('dialog "');
+    const hasDialog = /role="(?:dialog|alertdialog)"/.test(after.snap) ||
+                      after.snap.includes('dialog "');
+    if (!hadDialog && hasDialog) return 'modal';
+
+    // 3. Significant content change on same URL
+    // Threshold: interactive count changed by >3 or >40%
+    const delta = Math.abs(after.interactiveCount - before.interactiveCount);
+    const pct = before.interactiveCount > 0
+        ? delta / before.interactiveCount
+        : 0;
+
+    if (delta > 3 || pct > 0.4) return 'content-change';
+
+    return 'none';
+}
+
+// ── walkFlow ──────────────────────────────────────────────────────────────
+
+export async function walkFlow(
+    plan: FlowPlan,
+    url: string,
+    outputDir: string,
+): Promise<WalkResult> {
+    const enc = new TextEncoder();
+    await Deno.mkdir(outputDir, { recursive: true });
+    const ts = () => new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+
+    Deno.stdout.writeSync(enc.encode(
+        `\n  🔍  Walking flow: ${bold(url)}\n` +
+        `      ${plan.steps.length} step(s), ${plan.pageStates.length} planned page state(s)\n\n`,
+    ));
+
+    const client = new StdioMCPClient();
+
+    try {
+        // ── Start browser ─────────────────────────────────────────────
+        try {
+            await client.start();
+        } catch (e) {
+            Deno.stdout.writeSync(enc.encode(
+                `\n  ${red('❌')}  Cannot start @playwright/mcp\n` +
+                `      npm install -g @playwright/mcp@latest\n` +
+                `      ${String(e).slice(0, 120)}\n\n`,
+            ));
+            return { states: [], success: false, failedAt: 'browser start' };
+        }
+
+        const states: DiscoveredState[] = [];
+
+        // Map plan pageStateId → discovered state (for later assertion lookup)
+        const stateByPlanId = new Map<string, DiscoveredState>();
+
+        // Current plan state cursor
+        let planStateIdx = 0;
+        const currentPlanState = () => plan.pageStates[planStateIdx];
+
+        // Capture and record the current page as a discovered state
+        const captureCurrentPage = async (
+            pageStateId: string,
+            screenName: string,
+            detectedBy: DiscoveredState['detectedBy'],
+            currentUrl: string,
+        ): Promise<DiscoveredState> => {
+            const shotPath = `${outputDir}/${pageStateId}-${ts()}.png`;
+            await client.tool('browser_screenshot', { filename: shotPath, raw: false }).catch(() => {});
+            const snap = await client.tool('browser_snapshot', {}).catch(() => '');
+            const elements = parseSnapshot(snap);
+
+            const interactive = elements.filter(e => e.kind === 'interactive');
+            const outputs = elements.filter(e => e.kind === 'output');
+
+            Deno.stdout.writeSync(enc.encode(
+                `\n  ${cyan('📸')}  [${pageStateId}] ${screenName} (${detectedBy})\n` +
+                `      URL: ${currentUrl || '(unknown)'}\n` +
+                `      ${interactive.length} interactive, ${outputs.length} output\n` +
+                `      Screenshot: ${shotPath}\n`,
+            ));
+
+            const state: DiscoveredState = {
+                pageStateId,
+                screenName,
+                url: currentUrl,
+                elements,
+                screenshotPath: shotPath,
+                assertionResults: [],
+                detectedBy,
+            };
+
+            states.push(state);
+            stateByPlanId.set(pageStateId, state);
+            return state;
+        };
+
+        // ── Walk steps ────────────────────────────────────────────────
+        let snap = '';
+        let pageState: PageState = { url: '', interactiveCount: 0, snap: '' };
+
+        for (let i = 0; i < plan.steps.length; i++) {
+            const step = plan.steps[i];
+            const stepLabel = `step ${i + 1}/${plan.steps.length}: ${step.kind}` +
+                (step.hint ? ` "${step.hint}"` : '') +
+                (step.value ? ` = "${step.value}"` : '');
+
+            Deno.stdout.writeSync(enc.encode(`      ${yellow('→')} ${stepLabel}\n`));
+
+            // ── navigate ───────────────────────────────────────────────
+            if (step.kind === 'navigate') {
+                try {
+                    await client.tool('browser_navigate', { url });
+                    await new Promise(r => setTimeout(r, 1000));
+                } catch (e) {
+                    const msg = String(e);
+                    Deno.stdout.writeSync(enc.encode(
+                        `\n  ${red('❌')}  Cannot reach ${url}\n      ${msg.slice(0, 150)}\n\n`,
+                    ));
+                    await client.stop();
+                    return { states, success: false, failedAt: `navigate to ${url}` };
+                }
+
+                snap = await client.tool('browser_snapshot', {}).catch(() => '');
+                const currentUrl = extractUrl(snap);
+                pageState = { url: currentUrl, interactiveCount: countInteractive(snap), snap };
+
+                const ps = currentPlanState();
+                await captureCurrentPage(ps.id, ps.screenName, 'navigate', currentUrl);
+                continue;
+            }
+
+            // ── fill ───────────────────────────────────────────────────
+            if (step.kind === 'fill') {
+                snap = await client.tool('browser_snapshot', {}).catch(() => snap);
+                const ref = findRef(snap, step.hint ?? '', 'textbox') ??
+                            findRef(snap, step.hint ?? '');
+
+                if (ref) {
+                    await client.tool('browser_type', { ref, text: step.value ?? '' }).catch(e =>
+                        Deno.stdout.writeSync(enc.encode(`      ${yellow('⚠️')}  type failed: ${String(e).slice(0, 80)}\n`)),
+                    );
+                } else {
+                    Deno.stdout.writeSync(enc.encode(`      ${yellow('⚠️')}  no element for hint "${step.hint}"\n`));
+                }
+                continue;
+            }
+
+            // ── click ──────────────────────────────────────────────────
+            if (step.kind === 'click') {
+                snap = await client.tool('browser_snapshot', {}).catch(() => snap);
+                const before: PageState = {
+                    url: extractUrl(snap),
+                    interactiveCount: countInteractive(snap),
+                    snap,
+                };
+
+                const ref = findRef(snap, step.hint ?? '', 'button') ??
+                            findRef(snap, step.hint ?? '', 'link') ??
+                            findRef(snap, step.hint ?? '');
+
+                if (!ref) {
+                    Deno.stdout.writeSync(enc.encode(`      ${yellow('⚠️')}  no element for hint "${step.hint}"\n`));
+                    continue;
+                }
+
+                await client.tool('browser_click', { ref }).catch(e =>
+                    Deno.stdout.writeSync(enc.encode(`      ${yellow('⚠️')}  click failed: ${String(e).slice(0, 80)}\n`)),
+                );
+
+                // Wait for any navigation or content update to settle
+                await new Promise(r => setTimeout(r, 1200));
+
+                snap = await client.tool('browser_snapshot', {}).catch(() => snap);
+                const after: PageState = {
+                    url: extractUrl(snap),
+                    interactiveCount: countInteractive(snap),
+                    snap,
+                };
+
+                const change = detectChange(before, after);
+
+                if (change !== 'none') {
+                    // Advance to next plan state if available
+                    const nextPlanState = plan.pageStates[planStateIdx + 1];
+
+                    if (nextPlanState) {
+                        planStateIdx++;
+                        await captureCurrentPage(
+                            nextPlanState.id,
+                            nextPlanState.screenName,
+                            change,
+                            after.url,
+                        );
+                    } else {
+                        // More states than planned — create an auto-named one
+                        const autoId = `page-${states.length + 1}`;
+                        const autoName = `Page${states.length + 1}Screen`;
+                        Deno.stdout.writeSync(enc.encode(
+                            `      ${yellow('ℹ️')}  Unexpected page state detected (${change}) — capturing as ${autoName}\n`,
+                        ));
+                        await captureCurrentPage(autoId, autoName, change, after.url);
+                    }
+                    pageState = after;
+                }
+                continue;
+            }
+
+            // ── assert ─────────────────────────────────────────────────
+            if (step.kind === 'assert') {
+                snap = await client.tool('browser_snapshot', {}).catch(() => snap);
+
+                // Find the state this assertion belongs to
+                const targetState = stateByPlanId.get(step.pageStateId)
+                    ?? states[states.length - 1];
+
+                if (!targetState) continue;
+
+                if (step.assertionKind === 'text' && step.assertionValue) {
+                    const found = snap.toLowerCase().includes(step.assertionValue.toLowerCase());
+                    const locator = `page.getByText(${JSON.stringify(step.assertionValue)})`;
+
+                    // Find the best matching Screen prop for this text
+                    // Score by trigram coverage: longer name match = more specific = better
+                    const textLower = step.assertionValue.toLowerCase();
+                    let bestProp: string | undefined;
+                    let bestScore = 0;
+                    for (const el of targetState.elements) {
+                        const nl = el.name.toLowerCase();
+                        let score = 0;
+                        for (let i = 0; i <= nl.length - 3; i++) {
+                            if (textLower.includes(nl.slice(i, i + 3))) score++;
+                        }
+                        score += nl.length * 0.1; // prefer longer (more specific) names
+                        if (score > bestScore) { bestScore = score; bestProp = el.propName; }
+                    }
+
+                    targetState.assertionResults.push({
+                        assertionKind: 'text',
+                        assertionValue: step.assertionValue,
+                        passed: found,
+                        locator,
+                        matchedPropName: bestProp,
+                        note: found
+                            ? `✅ Text found: "${step.assertionValue}"` +
+                              (bestProp ? ` → ${bestProp}` : '')
+                            : `⚠️  Text NOT found: "${step.assertionValue}"`,
+                    });
+                    Deno.stdout.writeSync(enc.encode(
+                        `      ${found ? green('✅') : yellow('⚠️')}  text "${step.assertionValue}": ${found ? 'FOUND' : 'NOT FOUND'}\n`,
+                    ));
+
+                } else if (step.assertionKind === 'visible' && step.hint) {
+                    const ref = findRef(snap, step.hint);
+                    const targetState2 = stateByPlanId.get(step.pageStateId) ?? states[states.length - 1];
+                    const matchedEl = ref
+                        ? targetState2.elements.find(e => snap.includes(e.name) && snap.includes(`[ref=${ref}]`))
+                        : null;
+                    const locator = matchedEl?.locator ?? `page.getByText(${JSON.stringify(step.hint)})`;
+
+                    targetState.assertionResults.push({
+                        assertionKind: 'visible',
+                        passed: !!ref,
+                        locator,
+                        note: ref ? `✅ Element found: "${step.hint}"` : `⚠️  Not found: "${step.hint}"`,
+                    });
+                    Deno.stdout.writeSync(enc.encode(
+                        `      ${ref ? green('✅') : yellow('⚠️')}  visible "${step.hint}": ${ref ? 'FOUND' : 'NOT FOUND'}\n`,
+                    ));
+
+                } else if (step.assertionKind === 'url' && step.assertionValue) {
+                    const currentUrl = extractUrl(snap);
+                    const found = currentUrl.includes(step.assertionValue);
+                    targetState.assertionResults.push({
+                        assertionKind: 'url',
+                        assertionValue: step.assertionValue,
+                        passed: found,
+                        locator: 'page.url()',
+                        note: found ? `✅ URL matches` : `⚠️  URL mismatch (got: ${currentUrl})`,
+                    });
+                }
+                continue;
+            }
+
+            // ── wait ───────────────────────────────────────────────────
+            if (step.kind === 'wait') {
+                await new Promise(r => setTimeout(r, 1500));
+                snap = await client.tool('browser_snapshot', {}).catch(() => snap);
+                // After wait, check if content changed significantly
+                const after: PageState = {
+                    url: extractUrl(snap),
+                    interactiveCount: countInteractive(snap),
+                    snap,
+                };
+                if (detectChange(pageState, after) !== 'none') {
+                    snap = after.snap;
+                    pageState = after;
+                }
+                continue;
+            }
+
+            // ── screenshot ─────────────────────────────────────────────
+            if (step.kind === 'screenshot') {
+                const shotPath = `${outputDir}/manual-screenshot-${ts()}.png`;
+                await client.tool('browser_screenshot', { filename: shotPath, raw: false }).catch(() => {});
+                Deno.stdout.writeSync(enc.encode(`      📷  ${shotPath}\n`));
+                continue;
+            }
+        }
+
+        await client.stop();
+
+        // ── Summary ───────────────────────────────────────────────────
+        Deno.stdout.writeSync(enc.encode(`\n  ${cyan('✅')}  Walk complete: ${states.length} page state(s)\n`));
+        for (const s of states) {
+            const passed = s.assertionResults.filter(a => a.passed).length;
+            const total  = s.assertionResults.length;
+            Deno.stdout.writeSync(enc.encode(
+                `      [${s.pageStateId}] ${s.screenName} — ` +
+                `${s.elements.length} elements` +
+                (total ? `, ${passed}/${total} assertions` : '') + '\n',
+            ));
+            for (const a of s.assertionResults) {
+                Deno.stdout.writeSync(enc.encode(`        ${a.note}\n`));
+            }
+        }
+        Deno.stdout.writeSync(enc.encode('\n'));
+
+        return { states, success: true };
+
+    } catch (err) {
+        await client.stop().catch(() => {});
+        Deno.stdout.writeSync(enc.encode(
+            `\n  ${red('❌')}  walkFlow crashed: ${String(err).slice(0, 200)}\n\n`,
+        ));
+        return { states: [], success: false, failedAt: String(err) };
+    }
+}

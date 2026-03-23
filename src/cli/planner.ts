@@ -1,126 +1,181 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // testla-cli · src/cli/planner.ts
 //
-// Asks the LLM ONE question: given the page elements and the task description,
-// return structured JSON describing what actions to perform and what to assert.
+// Two LLM calls:
 //
-// The LLM never touches file paths, project dirs, or URLs.
-// It only reasons about user interactions and assertions.
+//   1. planTask()     → FlowPlan (page states + ordered steps, no element names)
+//   2. resolveTargets() → fill in target propNames from discovered elements
+//
+// The LLM never sees file paths, project dirs, or TypeScript.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import type { LLMProvider } from '../llm/types.ts';
 
-export interface TaskAction {
-    /** e.g. "Navigate", "Fill", "Click", "Wait" */
-    action: string;
-    /** prop name from Screen, e.g. "USERNAME_INPUT" */
-    target?: string;
-    /** value for Fill actions */
+// ── Types ─────────────────────────────────────────────────────────────────
+
+export type StepKind = 'navigate' | 'fill' | 'click' | 'wait' | 'assert' | 'screenshot';
+export type AssertionKind = 'text' | 'visible' | 'url';
+
+export interface FlowStep {
+    pageStateId: string;
+    kind: StepKind;
+    // fill / click / assert(visible)
+    hint?: string;              // describes the element in plain language
+    target?: string;            // resolved propName after discovery
+    // fill
     value?: string;
+    // assert
+    assertionKind?: AssertionKind;
+    assertionValue?: string;    // exact text or URL fragment
 }
 
-export interface TestPlan {
-    /** PascalCase name for the Screen class, e.g. "LoginScreen" */
-    screenName: string;
-    /** PascalCase name for the Task class, e.g. "LoginTask" */
+export interface PageState {
+    id: string;           // kebab, e.g. "login", "secure-area"
+    screenName: string;   // PascalCase, e.g. "LoginScreen"
+    description: string;
+}
+
+export interface FlowPlan {
     taskName: string;
-    /** PascalCase name for the Question class, e.g. "IsLoginSuccessful" */
-    questionName: string;
-    /** Human-readable describe label */
     describeLabel: string;
-    /** Ordered list of actions for the Task */
-    actions: TaskAction[];
-    /** What the Question checks — plain description */
-    assertionDescription: string;
-    /** The prop name from the Screen to assert on, e.g. "FLASH_MESSAGE_OUTPUT" */
-    assertionTarget?: string;
-    /** Text to validate on the page (e.g., "You logged into a secure area!") */
-    assertionText?: string;
-    /** Playwright assertion expression using the assertionTarget locator */
-    assertionExpression?: string;
+    pageStates: PageState[];
+    steps: FlowStep[];
 }
 
-const PLANNER_SYSTEM = `You are a test planning assistant for Playwright + testla-screenplay.
+// ── planTask ──────────────────────────────────────────────────────────────
 
-Given:
-- A task description with numbered steps
-- A list of discovered page elements with their Playwright locators
+const PLAN_SYSTEM = `You are a test flow planner for Playwright + testla-screenplay.
 
-CRITICAL: Use ONLY the element prop names from the discovered elements list. Do NOT invent prop names.
+Analyze the task and return a FlowPlan as strict JSON. No markdown, no explanation.
 
-Return ONLY a JSON object (no markdown, no explanation) with this exact shape:
+Rules for pageStates:
+- One entry per distinct page/route the user visits
+- A new pageState begins only when a click causes a full navigation (new URL)
+- Same-page dynamic updates (content changes, dropdowns, etc.) stay in the same pageState
+
+Rules for steps:
+- "navigate"   → always the first step, no hint needed
+- "fill"       → add hint (e.g. "username input"), add value (exact text to type)
+- "click"      → add hint (e.g. "login button") — the browser auto-detects if navigation follows
+- "assert"     → placed immediately after the action it validates
+    - kind "text"    → assertionValue = exact visible text to find
+    - kind "visible" → hint = which element should be visible
+    - kind "url"     → assertionValue = URL substring to check
+- "screenshot" → optional, after key interactions
+- "wait"       → only if task explicitly says to wait
+
+Do NOT invent element propNames — leave target as null everywhere.
+Use plain-language hints only.
+
+Example for "login then verify message":
 {
-  "screenName": "LoginScreen",
   "taskName": "LoginTask",
-  "questionName": "IsLoginSuccessful",
   "describeLabel": "Login at the-internet",
-  "actions": [
-    { "action": "Navigate" },
-    { "action": "Fill", "target": "USERNAME", "value": "tomsmith" },
-    { "action": "Fill", "target": "PASSWORD", "value": "SuperSecretPassword!" },
-    { "action": "Click", "target": "LOGIN" }
+  "pageStates": [
+    { "id": "login", "screenName": "LoginScreen", "description": "Login form" },
+    { "id": "secure", "screenName": "SecureAreaScreen", "description": "Post-login page" }
   ],
-  "assertionDescription": "Checks that login was successful",
-  "assertionTarget": "LOGIN",
-  "assertionText": "You logged into a secure area!"
-}
+  "steps": [
+    { "pageStateId": "login",  "kind": "navigate" },
+    { "pageStateId": "login",  "kind": "fill",   "hint": "username input",  "value": "tomsmith" },
+    { "pageStateId": "login",  "kind": "fill",   "hint": "password input",  "value": "SuperSecretPassword!" },
+    { "pageStateId": "login",  "kind": "click",  "hint": "login button" },
+    { "pageStateId": "secure", "kind": "assert", "assertionKind": "text",   "assertionValue": "You logged into a secure area!" },
+    { "pageStateId": "secure", "kind": "screenshot" }
+  ]
+}`;
 
-Example mapping - if discovered elements are:
-- USERNAME (textbox for username)
-- PASSWORD (textbox for password)
-- LOGIN (button to submit)
-- FORK_ME_ON_GITHUB (link element)
-
-Use EXACTLY these names in actions and assertionTarget. Do NOT invent names like "USERNAME_INPUT" or "LOGIN_BUTTON".
-
-Rules:
-- actions MUST follow the order from the task description exactly
-- Navigate is always first, no target needed
-- Fill actions use target (element prop name) and value (the actual text to type)
-- Click actions use target only
-- Use ONLY element propNames from the provided discovered elements list — NEVER invent prop names
-- For text validation: if task says "Validate the text: ..." or "Check for message: ...", add assertionText field
-- assertionTarget should be a prop name from discovered elements OR omit if using assertionText only
-- If task wants to validate text content (e.g., "You logged in!" message), use assertionText for that text
-- Do NOT add _INPUT or _BUTTON suffixes — use the exact prop names from discovery`;
-
-export async function planFromDiscovery(
+export async function planTask(
     provider: LLMProvider,
     task: string,
     url: string,
     featureName: string,
-    discoveryReport: string,
-): Promise<TestPlan | null> {
-    const userMessage =
-        `Task description:\n${task}\n\n` +
-        `Base URL: ${url}\n` +
-        `Feature name: ${featureName}\n\n` +
-        `Discovered page elements:\n${discoveryReport}\n\n` +
-        `Return the JSON test plan.`;
-
+): Promise<FlowPlan | null> {
     let response;
     try {
-        response = await provider.chat(
-            [
-                { role: 'system', content: PLANNER_SYSTEM },
-                { role: 'user', content: userMessage },
-            ],
-            [], // no tools — pure text response
-        );
+        response = await provider.chat([
+            { role: 'system', content: PLAN_SYSTEM },
+            { role: 'user', content: `Task: ${task}\nStart URL: ${url}\nFeature: ${featureName}\n\nReturn FlowPlan JSON.` },
+        ], []);
     } catch (err) {
-        console.error('Planner LLM call failed:', err);
+        console.error('planTask failed:', err);
         return null;
     }
 
-    const raw = (response.content ?? '').trim();
-
-    // Strip markdown fences if present
-    const cleaned = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+    const raw = (response.content ?? '').trim()
+        .replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
 
     try {
-        return JSON.parse(cleaned) as TestPlan;
+        return JSON.parse(raw) as FlowPlan;
     } catch {
-        console.error('Planner returned invalid JSON:', cleaned.slice(0, 300));
+        console.error('planTask: invalid JSON\n', raw.slice(0, 400));
         return null;
+    }
+}
+
+// ── resolveTargets ────────────────────────────────────────────────────────
+
+export interface DiscoveredPageState {
+    id: string;
+    elements: Array<{ propName: string; role: string; name: string }>;
+}
+
+const RESOLVE_SYSTEM = `Match plain-language hints to element propNames.
+Use ONLY propNames from the provided element lists. Never invent names.
+Return ONLY JSON: { "targets": { "0": "PROP_NAME_OR_NULL", ... } }`;
+
+export async function resolveTargets(
+    provider: LLMProvider,
+    plan: FlowPlan,
+    discovered: DiscoveredPageState[],
+): Promise<FlowPlan> {
+    // Only steps that need a target and don't have one yet
+    const toResolve = plan.steps
+        .map((s, i) => ({ s, i }))
+        .filter(({ s }) =>
+            (s.kind === 'fill' || s.kind === 'click' ||
+            (s.kind === 'assert' && s.assertionKind === 'visible')) &&
+            !s.target && s.hint,
+        );
+
+    if (toResolve.length === 0) return plan;
+
+    const elementContext = discovered
+        .map(d => {
+            const list = d.elements.length
+                ? d.elements.map(e => `  - ${e.propName} (${e.role}: "${e.name}")`).join('\n')
+                : '  (no elements found)';
+            return `Page "${d.id}":\n${list}`;
+        }).join('\n\n');
+
+    const stepsText = toResolve
+        .map(({ s }, n) =>
+            `${n}: ${s.kind} on page "${s.pageStateId}" — hint: "${s.hint}"` +
+            (s.value ? ` value: "${s.value}"` : ''),
+        ).join('\n');
+
+    let response;
+    try {
+        response = await provider.chat([
+            { role: 'system', content: RESOLVE_SYSTEM },
+            { role: 'user', content: `Elements:\n${elementContext}\n\nSteps to resolve:\n${stepsText}` },
+        ], []);
+    } catch {
+        return plan; // unresolved is better than crash
+    }
+
+    const raw = (response.content ?? '').trim()
+        .replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+
+    try {
+        const { targets } = JSON.parse(raw) as { targets: Record<string, string | null> };
+        const steps = [...plan.steps];
+        toResolve.forEach(({ i }, n) => {
+            const t = targets[String(n)];
+            if (t) steps[i] = { ...steps[i], target: t };
+        });
+        return { ...plan, steps };
+    } catch {
+        return plan;
     }
 }

@@ -4,7 +4,7 @@
 // ─────────────────────────────────────────────────────────────
 
 import type { AgentTool, ToolInput, ToolResult } from './types.ts';
-import { discoverPageTool } from './discover.ts';
+// discover_page is now called directly via discoverStartPage/discoverResultPage
 
 // ─── Shell ───────────────────────────────────────────────────
 
@@ -260,5 +260,4 @@ export const BUILTIN_TOOLS: AgentTool[] = [
     listDirTool,
     deleteFileTool,
     checkTestlaProjectTool,
-    discoverPageTool,
 ];

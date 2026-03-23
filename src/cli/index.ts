@@ -19,8 +19,10 @@ import { BUILTIN_TOOLS, checkTestlaProjectTool } from '../agent/tools.ts';
 import { loadMCPTools } from '../mcp/client.ts';
 import { registerSkillsCommands } from './skills-cmd.ts';
 import { runSetup } from './setup.ts';
-import { planFromDiscovery } from './planner.ts';
-import type { TaskAction } from './planner.ts';
+import { planTask, resolveTargets } from './planner.ts';
+import type { FlowPlan, FlowStep } from '../cli/planner.ts';
+import { walkFlow } from '../agent/discover.ts';
+import type { DiscoveredState, WalkResult } from '../agent/discover.ts';
 
 async function loadSkills(
     config: Awaited<ReturnType<ConfigManager['load']>>,
@@ -130,164 +132,190 @@ async function runAgentTask(
     const shellTool = BUILTIN_TOOLS.find((t) => t.name === 'shell');
     const maxAttempts = options.iterations ?? config.agent.maxIterations ?? 30;
 
-    // ── Phase 2a: Discover real page elements ──────────────────────
-    const discoverTool = BUILTIN_TOOLS.find((t) => t.name === 'discover_page');
-    let discoveryReport = '';
-
-    if (discoverTool) {
-        console.log(cyan('🔍'), 'Discovering page elements at', bold(url));
-        const discoverResult = await discoverTool.execute({
-            url,
-            outputDir: `${projectDir}/test-results/discover`,
-        });
-
-        if (!discoverResult.success) {
-            console.log(red('❌ Page discovery failed:'), discoverResult.error);
-            console.log(yellow('   Continuing — tests may need manual fixes.'));
-        } else {
-            discoveryReport = discoverResult.output;
-            console.log(green('✅'), 'Page discovered');
-        }
-    }
-
-    // ── Phase 2b: LLM plans actions (JSON only, no tool calls) ───────
+    // ══════════════════════════════════════════════════════════════════════════
+    // STEP 3: Plan — LLM reads the prompt and returns a structured FlowPlan
+    // ══════════════════════════════════════════════════════════════════════════
     const featureName = deriveProjectName(url).replace(/^testla-/, '');
     const provider = createProvider(config.llm);
 
-    console.log(cyan('🧠'), 'Planning test structure...');
-    const plan = await planFromDiscovery(provider, task, url, featureName, discoveryReport);
+    console.log(cyan('\n🧠  Step 3: Planning test flow...'));
+    const plan = await planTask(provider, task, url, featureName);
 
     if (!plan) {
-        console.log(red('❌ Planning failed — LLM did not return a valid plan.'));
+        console.log(red('❌  Planning failed — check LLM connection.'));
+        return;
+    }
+    console.log(green('✅'), `${plan.pageStates.length} page state(s), ${plan.steps.length} step(s)`);
+    console.log(cyan('   Flow:'), plan.pageStates.map(p => p.screenName).join(' → '));
+    for (const a of plan.steps.filter(s => s.kind === 'assert')) {
+        console.log(cyan('   Assert:'), a.assertionKind,
+            a.assertionValue ? `"${a.assertionValue}"` : `visible "${a.hint}"`);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // STEP 4: Walk — execute all steps in one real browser session.
+    //         After every page state change: snapshot → Screen class.
+    //         Nothing else happens here. Pure discovery.
+    // ══════════════════════════════════════════════════════════════════════════
+    const discoverDir = `${projectDir}/test-results/discover`;
+    console.log(cyan('\n🔍  Step 4: Discovering all page states via real browser...'));
+
+    const walk = await walkFlow(plan, url, discoverDir);
+
+    if (!walk.success && walk.states.length === 0) {
+        console.log(red('❌  Flow walk failed:'), walk.failedAt);
         return;
     }
 
-    console.log(green('✅'), `Plan: ${plan.taskName} → ${plan.questionName}`);
+    console.log(green(`✅  ${walk.states.length} page state(s) discovered`));
 
-    // ── Phase 2c: CLI calls screenplay tools directly ─────────────────
-    // LLM never touches projectDir, URL, or file paths.
+    // Resolve element targets: match hints from plan to discovered prop names
+    const resolvedPlan = await resolveTargets(provider, plan, walk.states.map(s => ({
+        id: s.pageStateId,
+        elements: s.elements,
+    })));
+
+    // Get screenplay tools
     const allScreenplayTools = [...registry.getAllTools()];
-    const screenTool    = allScreenplayTools.find((t) => t.name === 'screenplay_screen');
-    const taskTool      = allScreenplayTools.find((t) => t.name === 'screenplay_task');
-    const questionTool  = allScreenplayTools.find((t) => t.name === 'screenplay_question');
-    const specTool      = allScreenplayTools.find((t) => t.name === 'screenplay_spec');
+    const screenTool = allScreenplayTools.find(t => t.name === 'screenplay_screen');
+    const taskTool   = allScreenplayTools.find(t => t.name === 'screenplay_task');
+    const specTool   = allScreenplayTools.find(t => t.name === 'screenplay_spec');
 
-    if (!screenTool || !taskTool || !questionTool || !specTool) {
-        console.log(red('❌ Missing screenplay tools. Enable playwright-screenplay skill.'));
+    if (!screenTool || !taskTool || !specTool) {
+        console.log(red('❌  Missing screenplay tools. Enable playwright-screenplay skill.'));
         return;
     }
 
-    // Parse discovered elements for the screen
-    const screenElements = parseDiscoveredElements(discoveryReport);
-
-    // 1) Screen
-    console.log(cyan('📄'), `Generating ${plan.screenName}...`);
-    const screenResult = await screenTool.execute({
-        name: plan.screenName,
-        projectDir,
-        elements: screenElements,
-    });
-    if (!screenResult.success) {
-        console.log(red('❌ Screen generation failed:'), screenResult.error);
-        return;
+    // Generate one Screen class per discovered page state
+    console.log(cyan('\n📄  Step 4 → Generating Screen classes...'));
+    for (const state of walk.states) {
+        const r = await screenTool.execute({
+            name: state.screenName,
+            projectDir,
+            elements: state.elements.map(e => ({ name: e.propName, selector: e.locator, isLazy: true })),
+        });
+        if (r.success) {
+            console.log(green('✅'), state.screenName, `(${state.elements.length} elements)`);
+        } else {
+            console.log(red('❌'), state.screenName, r.error ?? '');
+        }
     }
-    console.log(green('✅'), screenResult.output.split('\n')[0]);
 
-    // 2) Task — build action strings from the plan, in order
-    const actionStrings = buildActionStrings(plan.actions, plan.screenName, url);
-    console.log(cyan('📄'), `Generating ${plan.taskName}...`);
+    // ══════════════════════════════════════════════════════════════════════════
+    // STEP 5a: Decide if a custom Question class is needed.
+    //
+    // Standard assertions (no custom Question needed):
+    //   - text:    Element.toBe.visible(page.getByText('exact text'))
+    //   - visible: Element.toBe.visible(Screen.PROP)
+    //   - url:     expect(page.url()).toContain('fragment')
+    //
+    // Custom Question needed only for complex assertions:
+    //   - checking an element's text VALUE (not just visibility)
+    //   - counting elements
+    //   - comparing state across multiple elements
+    // ══════════════════════════════════════════════════════════════════════════
+    const assertSteps = resolvedPlan.steps.filter(s => s.kind === 'assert');
+    const needsCustomQuestion = assertSteps.some(s =>
+        s.assertionKind === 'count' || s.assertionKind === 'value'
+    );
+
+    console.log(cyan('\n🤔  Step 5a:'),
+        needsCustomQuestion ? 'Custom Question needed' : 'No custom Question needed — using Element.toBe.visible()');
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // STEP 5b: Generate Task
+    //          Uses Screen classes from Step 4.
+    //          All imports reference real prop names from discovered screens.
+    // ══════════════════════════════════════════════════════════════════════════
+    console.log(cyan('\n📄  Step 5b: Generating Task...'));
+
+    const actionSteps = resolvedPlan.steps.filter(
+        s => s.kind === 'fill' || s.kind === 'click' || s.kind === 'navigate'
+    );
+    const firstPageState = resolvedPlan.pageStates[0];
+    const taskActionStrings = buildTaskActions(actionSteps, resolvedPlan, url);
+
+    // Collect all screen imports needed by the task
+    // (only screens that have elements used in actions)
+    const screenNamesUsedInTask = [...new Set(
+        actionSteps
+            .filter(s => s.kind !== 'navigate')
+            .map(s => resolvedPlan.pageStates.find(p => p.id === s.pageStateId)?.screenName)
+            .filter(Boolean) as string[]
+    )];
+
     const taskResult = await taskTool.execute({
-        name: plan.taskName,
+        name: resolvedPlan.taskName,
         projectDir,
-        screenImport: plan.screenName,
-        description: plan.describeLabel,
-        actions: actionStrings,
+        screenImport: firstPageState?.screenName ?? '',
+        description: resolvedPlan.describeLabel,
+        actions: taskActionStrings,
         factoryMethod: 'toApp',
-        webActions: inferWebActions(plan.actions),
+        webActions: inferWebActions(actionSteps),
     });
-    if (!taskResult.success) {
-        console.log(red('❌ Task generation failed:'), taskResult.error);
-        return;
-    }
-    console.log(green('✅'), taskResult.output.split('\n')[0]);
+    console.log(taskResult.success ? green('✅') : red('❌'), resolvedPlan.taskName,
+        taskResult.success ? '' : taskResult.error ?? '');
+    if (!taskResult.success) return;
 
-    // 3) Spec — uses Element.toBe.visible() directly, no separate Question class
-    //    Pattern: await Bob.asks(Element.toBe.visible(Screen.PROP))
-    //    Or for text validation: expect(page).toContainText('text')
-    const kebabTask = toKebab(plan.taskName);
-    
-    // Validate assertionTarget exists in screenElements, otherwise fallback to last element
-    const elementNames = new Set(screenElements.map(e => e.name));
-    const assertionProp = (plan.assertionTarget && elementNames.has(plan.assertionTarget)) 
-        ? plan.assertionTarget 
-        : screenElements[screenElements.length - 1]?.name ?? 'ELEMENT';
-    
-    if (plan.assertionTarget && !elementNames.has(plan.assertionTarget)) {
-        console.log(yellow('⚠️  Assertion target not found:'), plan.assertionTarget);
-        console.log(yellow('     Available elements:'), [...elementNames].join(', '));
-        console.log(yellow('     Using fallback:'), assertionProp);
-    }
+    // ══════════════════════════════════════════════════════════════════════════
+    // STEP 5c: Generate Spec
+    //          Calls the Task, then validates using Screen classes from Step 4.
+    //          Imports ONLY the screens actually used in assertions.
+    // ══════════════════════════════════════════════════════════════════════════
+    console.log(cyan('\n📄  Step 5c: Generating Spec...'));
 
-    console.log(cyan('📄'), `Generating ${featureName}.spec.ts...`);
-    
-    // Build assertion body based on whether we have text validation
-    let assertionBody: string;
-    if (plan.assertionText) {
-        // Text-based assertion: use page.locator(...).toContainText()
-        assertionBody = 
-            `const page = BrowseTheWeb.as(Bob).getPage();\n` +
-            `        await expect(page).toContainText(${JSON.stringify(plan.assertionText)});`;
-    } else {
-        // Element-based assertion: use Element.toBe.visible()
-        assertionBody = `Element.toBe.visible(${plan.screenName}.${assertionProp})`;
-    }
-    
+    // Build assertion lines — each uses a locator from a discovered screen
+    const assertionLines = buildAssertionLines(assertSteps, resolvedPlan, walk.states);
+
+    // Collect screen imports: task screen + assertion screens
+    const screenNamesForSpec = [...new Set([
+        firstPageState?.screenName,
+        ...assertSteps.map(s => resolvedPlan.pageStates.find(p => p.id === s.pageStateId)?.screenName),
+    ].filter(Boolean) as string[])];
+
+    const taskCall =
+        `await Bob.attemptsTo(\n` +
+        `    ${resolvedPlan.taskName}.toApp()\n` +
+        `);`;
+
+    const specTests = [
+        {
+            name: assertionLines.length > 0
+                ? 'executes flow and validates'
+                : 'executes flow',
+            body: assertionLines.length > 0
+                ? taskCall + '\n' + assertionLines.join('\n')
+                : taskCall,
+        },
+        {
+            name: 'takes a screenshot',
+            body:
+                taskCall + '\n' +
+                `const page = BrowseTheWeb.as(Bob).getPage();\n` +
+                `await page.screenshot({ path: 'test-results/${featureName}.png', fullPage: true });`,
+        },
+    ];
+
     const specResult = await specTool.execute({
         name: featureName,
         projectDir,
-        describeLabel: plan.describeLabel,
+        describeLabel: resolvedPlan.describeLabel,
         imports: [
-            `import { ${plan.screenName} } from '../src/screenplay/screens/${toKebab(plan.screenName)}';`,
-            `import { ${plan.taskName} } from '../src/screenplay/tasks/${kebabTask}';`,
-            // Element is already imported in spec template, so don't duplicate it
+            ...screenNamesForSpec.map(n =>
+                `import { ${n} } from '../src/screenplay/screens/${toKebab(n)}';`
+            ),
+            `import { ${resolvedPlan.taskName} } from '../src/screenplay/tasks/${toKebab(resolvedPlan.taskName)}';`,
         ],
-        tests: [
-            {
-                name: 'execute task and verify outcome',
-                body:
-                    `await Bob.attemptsTo(\n` +
-                    `            ${plan.taskName}.toApp()\n` +
-                    `        );\n` +
-                    (plan.assertionText 
-                        ? `        ${assertionBody}`
-                        : `        await Bob.asks(\n` +
-                          `            ${assertionBody}\n` +
-                          `        );`
-                    ),
-            },
-            {
-                name: 'takes a screenshot',
-                body:
-                    `await Bob.attemptsTo(\n` +
-                    `            ${plan.taskName}.toApp()\n` +
-                    `        );\n` +
-                    `        const page = BrowseTheWeb.as(Bob).getPage();\n` +
-                    `        await page.screenshot({ path: 'test-results/${featureName}.png', fullPage: true });`,
-            },
-        ],
+        tests: specTests,
     });
-    if (!specResult.success) {
-        console.log(red('❌ Spec generation failed:'), specResult.error);
-        return;
-    }
-    console.log(green('✅'), specResult.output.split('\n')[0]);
+    console.log(specResult.success ? green('✅') : red('❌'), `${featureName}.spec.ts`,
+        specResult.success ? '' : specResult.error ?? '');
+    if (!specResult.success) return;
 
-    // Tools available for fix loop
+    // Tools for fix loop
     const allTools = [...BUILTIN_TOOLS, ...registry.getAllTools(), ...mcpTools];
-    const agentTools = allTools.filter(
-        (t) => t.name !== 'testla_create_project' &&
-               t.name !== 'testla_install_deps' &&
-               t.name !== 'discover_page',
+    const agentTools = allTools.filter(t =>
+        t.name !== 'testla_create_project' && t.name !== 'testla_install_deps',
     );
 
     // ── Phase 3: Verify loop ──────────────────────────────────────────
@@ -338,12 +366,21 @@ async function runAgentTask(
             `Fix the failing TypeScript/Playwright tests.\n\n` +
             `Project directory: ${projectDir}\n\n` +
             `Test error output:\n${errorOutput}${fileContext}\n\n` +
-            `Instructions:\n` +
-            `- Use read_file to inspect the failing file\n` +
-            `- Use write_file to fix it\n` +
+            `STRICT RULES — read carefully before making any change:\n` +
             `- Only fix TypeScript errors, wrong imports, or wrong API calls\n` +
-            `- Do NOT use screenplay_screen, screenplay_task, screenplay_feature or any other generator tool\n` +
-            `- Do NOT invent new file paths`;
+            `- NEVER rewrite a spec file from scratch — only fix the specific error\n` +
+            `- NEVER use: new testla.screenplay.Actor(), bob.usesAbilities(), describe(), it()\n` +
+            `- Spec files MUST use this exact pattern:\n` +
+            `    import { test, expect } from '../src/screenplay/fixtures/actors';\n` +
+            `    test.describe('...', () => {\n` +
+            `        test('...', async ({ Bob }) => {\n` +
+            `            await Bob.attemptsTo(MyTask.toApp());\n` +
+            `            await Bob.asks(Element.toBe.visible(MyScreen.PROP));\n` +
+            `        });\n` +
+            `    });\n` +
+            `- Task files MUST use: return actor.attemptsTo(...) in performAs(actor: Actor)\n` +
+            `- Fill syntax: Fill.in(Screen.PROP, 'value') — NOT Fill.in(...).with(...)\n` +
+            `- Do NOT invent file paths or class names not already in the project`;
 
         console.log(cyan(`🔧 Fix attempt ${attempt}...`));
 
@@ -370,84 +407,111 @@ async function runAgentTask(
     }
 }
 
-// ── Helpers for Phase 2c ─────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────
 
 function toKebab(str: string): string {
     return str
-        .replace(/([a-z])([A-Z])/g, '$1-$2')
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, '-')
-        .replace(/^-+|-+$/g, '');
+        .replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
 }
 
-interface ParsedElement { name: string; selector: string; isLazy: boolean }
+function inferWebActions(steps: typeof plan.steps): string[] {
+    const s = new Set<string>();
+    for (const step of steps) {
+        if (step.kind === 'navigate') s.add('Navigate');
+        if (step.kind === 'fill')     s.add('Fill');
+        if (step.kind === 'click')    s.add('Click');
+    }
+    if (s.size === 0) s.add('Navigate');
+    return [...s];
+}
 
-function parseDiscoveredElements(report: string): ParsedElement[] {
-    const elements: ParsedElement[] = [];
-    // discover.ts outputs: { propName: "X", selector: "Y", isLazy: true },
-    // screenplay_screen expects: { name: "X", selector: "Y", isLazy: true }
-    // Parse each line that looks like a screenplay_screen element object
-    const lines = report.split('\n');
-    for (const line of lines) {
-        const trimmed = line.trim();
-        // Match lines like: { propName: "...", selector: "...", isLazy: true },
-        if (!trimmed.startsWith('{')) continue;
-        if (!trimmed.includes('propName:')) continue;
-        
-        try {
-            // Convert to valid JSON by adding quotes around keys and replacing JavaScript boolean with JSON true/false
-            const jsonStr = trimmed
-                .replace(/,\s*$/, '') // Remove trailing comma
-                .replace(/propName:/g, '"propName":')
-                .replace(/selector:/g, '"selector":')
-                .replace(/isLazy:/g, '"isLazy":');
-            
-            const obj = JSON.parse(jsonStr);
-            if (obj.propName && obj.selector && typeof obj.isLazy === 'boolean') {
-                elements.push({ 
-                    name: obj.propName, 
-                    selector: obj.selector, 
-                    isLazy: obj.isLazy 
-                });
-            }
-        } catch (e) {
-            // Skip malformed lines
-            continue;
+function buildTaskActions(
+    steps: typeof plan.steps,
+    plan: typeof resolvedPlan,
+    url: string,
+): string[] {
+    const lines: string[] = [];
+    for (const step of steps) {
+        if (step.kind === 'navigate') {
+            lines.push(`Navigate.to(process.env.BASE_URL ?? ${JSON.stringify(url)})`);
+        } else if (step.kind === 'fill') {
+            const screenName = plan.pageStates.find(p => p.id === step.pageStateId)?.screenName ?? '';
+            lines.push(step.target && screenName
+                ? `Fill.in(${screenName}.${step.target}, ${JSON.stringify(step.value ?? '')})`
+                : `// Fill "${step.hint}" — target not resolved`);
+        } else if (step.kind === 'click') {
+            const screenName = plan.pageStates.find(p => p.id === step.pageStateId)?.screenName ?? '';
+            lines.push(step.target && screenName
+                ? `Click.on(${screenName}.${step.target})`
+                : `// Click "${step.hint}" — target not resolved`);
         }
     }
-    return elements;
+    return lines;
 }
 
-function buildActionStrings(actions: TaskAction[], screenName: string, url: string): string[] {
-    return actions.map((a) => {
-        switch (a.action) {
-            case 'Navigate':
-                // Use process.env.BASE_URL so tests respect the playwright.config.ts baseURL.
-                // Falls back to the discovered URL if the env var is not set.
-                return `Navigate.to(process.env.BASE_URL ?? ${JSON.stringify(url)})`;
-            case 'Fill':
-                return `Fill.in(${screenName}.${a.target}, ${JSON.stringify(a.value ?? '')})`;
-            case 'Click':
-                return `Click.on(${screenName}.${a.target})`;
-            case 'Wait':
-                return `Wait.forLoadState('networkidle')`;
-            default:
-                return `// ${a.action}${a.target ? ' ' + screenName + '.' + a.target : ''}`;
+/**
+ * Build assertion lines for the Spec.
+ *
+ * For each assert step we look up the REAL locator from the discovered
+ * Screen elements — never guessing, never hardcoding.
+ *
+ * Priority order for 'text' assertions:
+ *   1. A Screen element whose accessible name contains the assertion text
+ *   2. page.getByText('...') as fallback
+ */
+function buildAssertionLines(
+    assertSteps: typeof plan.steps,
+    plan: typeof resolvedPlan,
+    states: typeof walk.states,
+): string[] {
+    const lines: string[] = [];
+
+    for (const step of assertSteps) {
+        const pageState = plan.pageStates.find(p => p.id === step.pageStateId);
+        const screenName = pageState?.screenName ?? '';
+        const discoveredState = states.find(s => s.pageStateId === step.pageStateId)
+            ?? states[states.length - 1];
+
+        if (step.assertionKind === 'text' && step.assertionValue) {
+            // The walk already found the best matching prop during discovery.
+            // Use it directly — no re-matching needed.
+            const ar = discoveredState?.assertionResults
+                .find(a => a.assertionValue === step.assertionValue);
+
+            const locator = ar?.matchedPropName && screenName
+                ? `${screenName}.${ar.matchedPropName}`
+                : `page.getByText(${JSON.stringify(step.assertionValue)})`;
+
+            lines.push(
+                `await Bob.asks(\n` +
+                `    Element.toBe.visible(${locator})\n` +
+                `);`
+            );
+
+        } else if (step.assertionKind === 'visible') {
+            // Use the resolved target prop, or fall back to text search
+            const locator = step.target && screenName
+                ? `${screenName}.${step.target}`
+                : `page.getByText(${JSON.stringify(step.hint ?? '')})`;
+
+            lines.push(
+                `await Bob.asks(\n` +
+                `    Element.toBe.visible(${locator})\n` +
+                `);`
+            );
+
+        } else if (step.assertionKind === 'url' && step.assertionValue) {
+            lines.push(
+                `const page = BrowseTheWeb.as(Bob).getPage();\n` +
+                `expect(page.url()).toContain(${JSON.stringify(step.assertionValue)});`
+            );
         }
-    });
+    }
+
+    return lines;
 }
 
-function inferWebActions(actions: TaskAction[]): string[] {
-    const needed = new Set<string>();
-    for (const a of actions) {
-        if (a.action === 'Navigate') needed.add('Navigate');
-        if (a.action === 'Fill')     needed.add('Fill');
-        if (a.action === 'Click')    needed.add('Click');
-        if (a.action === 'Wait')     needed.add('Wait');
-    }
-    if (needed.size === 0) needed.add('Navigate');
-    return [...needed];
-}
 
 function toPascalCase(str: string): string {
     return str
