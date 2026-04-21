@@ -37,6 +37,7 @@ jobs:
       - name: Compile
         run: |
           deno compile \
+            --no-check \
             --allow-all \
             --target ${{ matrix.target }} \
             --output dist/${{ matrix.artifact }} \

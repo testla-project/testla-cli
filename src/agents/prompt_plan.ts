@@ -1,4 +1,4 @@
-import type { AnalystPlan, PageState, PlanStep } from './analyst.ts';
+import type { AnalystPlan } from './analyst.ts';
 
 function toTitle(value: string): string {
     return value

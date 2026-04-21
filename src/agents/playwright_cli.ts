@@ -155,8 +155,10 @@ class ExplorerAgent {
   private async snapshot() {
     const elements = await this.page.evaluate(() => {
       return Array.from(
+  // @ts-ignore: runs in browser context
   document.querySelectorAll('a, button, input, textarea, select, [role], h1, h2, h3')
 ).map((el, i) => {
+  // @ts-ignore: runs in browser context
   const htmlEl = el as HTMLElement;
   const tag = htmlEl.tagName.toLowerCase();
   const testId = htmlEl.getAttribute('data-testid');
@@ -167,6 +169,7 @@ class ExplorerAgent {
     htmlEl.getAttribute('aria-label') || 
     htmlEl.innerText?.trim() || 
     htmlEl.getAttribute('placeholder') || 
+    // @ts-ignore: runs in browser context
     (htmlEl as HTMLInputElement).value ||
     ""
   ).replace(/\n/g, ' ').substring(0, 50); // Kürzen für LLM-Übersicht

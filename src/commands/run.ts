@@ -85,19 +85,19 @@ async function resolveBaseUrl(projectDir: string, prompt: string): Promise<strin
     return extracted;
 }
 
-async function buildExecutionPlan(
-    prompt: string,
-    baseUrl: string,
-    projectDir: string,
-): Promise<AnalystPlan> {
-    try {
-        const { plan } = await runAnalyst(prompt, baseUrl, projectDir);
-        return plan;
-    } catch (error) {
-        logger.warn(
-            'Analyst',
-            `LLM-Plan fehlgeschlagen, nutze lokalen Fallback-Parser: ${String(error)}`,
-        );
-        return buildPromptPlan(prompt, baseUrl);
-    }
-}
+// async function buildExecutionPlan(
+//     prompt: string,
+//     baseUrl: string,
+//     projectDir: string,
+// ): Promise<AnalystPlan> {
+//     try {
+//         const  plan  = await analystAgent(prompt, baseUrl, projectDir);
+//         return plan;
+//     } catch (error) {
+//         logger.warn(
+//             'Analyst',
+//             `LLM-Plan fehlgeschlagen, nutze lokalen Fallback-Parser: ${String(error)}`,
+//         );
+//         return buildPromptPlan(prompt, baseUrl);
+//     }
+// }

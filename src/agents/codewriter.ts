@@ -4,7 +4,7 @@
 // derived 100% from plan + actions — no hardcoded names.
 // Supports full Testla Action spectrum and strictly separates Tasks from Assertions.
 
-import type { AnalystPlan, Intention } from "./analyst.ts";
+import type { AnalystPlan, ToonIntention as Intention } from "./analyst.ts";
 import type { ExecutedAction } from "./playwright_cli.ts";
 import { logger } from "../utils/logger.ts";
 
