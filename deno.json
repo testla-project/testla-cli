@@ -2,8 +2,11 @@
     "name": "@testla/cli",
     "version": "0.1.0",
     "description": "Open-Source AI Agent for developers — runs in your terminal",
+    "nodeModulesDir": "auto",
     "exports": "./main.ts",
     "tasks": {
+        "lint": "deno lint",
+        "fmt": "deno fmt",
         "start": "deno run --allow-all main.ts",
         "dev": "deno run --allow-all --watch main.ts",
         "install": "deno install --allow-all --global --config deno.json -f -n testla main.ts",
@@ -13,9 +16,19 @@
         "@cliffy/command": "jsr:@cliffy/command@^1.0.0",
         "@cliffy/prompt": "jsr:@cliffy/prompt@^1.0.0",
         "@cliffy/ansi": "jsr:@cliffy/ansi@^1.0.0",
-        "@cliffy/table": "jsr:@cliffy/table@^1.0.0"
+        "@cliffy/table": "jsr:@cliffy/table@^1.0.0",
+        "playwright": "npm:playwright@^1.49.0",
+        "@std/fs": "jsr:@std/fs@^1.0.23",
+        "@std/path": "jsr:@std/path@^1.1.4",
+        "@ai-sdk/openai": "npm:@ai-sdk/openai@^1.3.7",
+        "@ai-sdk/azure": "npm:@ai-sdk/azure@^1.3.7",
+        "@ai-sdk/ollama": "npm:ollama-ai-provider@^1.2.0",
+        "@ai-sdk/provider-utils": "npm:@ai-sdk/provider-utils@^2.2.4",
+        "ai": "npm:ai@^4.3.2",
+        "openai": "npm:openai@^3.2.1"
     },
     "lint": {
+        "include": ["src/"],
         "rules": {
             "tags": ["recommended"]
         }
