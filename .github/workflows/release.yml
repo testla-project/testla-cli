@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: testla-linux-x64
+
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: testla-macos-x64
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: testla-macos-arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Compile
+        run: |
+          deno compile \
+            --allow-all \
+            --target ${{ matrix.target }} \
+            --output dist/${{ matrix.artifact }} \
+            main.ts
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.artifact }}
+          generate_release_notes: true

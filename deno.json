@@ -10,7 +10,11 @@
         "start": "deno run --allow-all main.ts",
         "dev": "deno run --allow-all --watch main.ts",
         "install": "deno install --allow-all --global --config deno.json -f -n testla main.ts",
-        "compile": "deno compile --allow-all -o dist/testla main.ts"
+        "compile": "deno compile --allow-all -o dist/testla main.ts",
+        "compile:linux": "deno compile --allow-all --target x86_64-unknown-linux-gnu  -o dist/testla-linux-x64    main.ts",
+        "compile:macos-x64": "deno compile --allow-all --target x86_64-apple-darwin       -o dist/testla-macos-x64   main.ts",
+        "compile:macos-arm": "deno compile --allow-all --target aarch64-apple-darwin      -o dist/testla-macos-arm64 main.ts",
+        "compile:all": "deno task compile:linux && deno task compile:macos-x64 && deno task compile:macos-arm"
     },
     "imports": {
         "@cliffy/command": "jsr:@cliffy/command@^1.0.0",
